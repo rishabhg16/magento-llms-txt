@@ -136,6 +136,25 @@ class GenerateTests(unittest.TestCase):
             m.generate(empty, "https://shop.example.com")
 
 
+class FilterTests(unittest.TestCase):
+    def test_exclude_skips_path_and_children_only(self):
+        text = m.generate(fake_fetch, "https://shop.example.com",
+                          exclude=["filters"])
+        self.assertNotIn("[Filters]", text)
+        self.assertNotIn("[Oil filters]", text)
+        self.assertIn("[Brakes]", text)
+
+    def test_exclude_does_not_match_similar_prefix(self):
+        rows = m.collect_categories(fake_fetch, "https://x.example", "",
+                                    exclude=["filter"])
+        self.assertTrue(any(r[1] == "Filters" for r in rows))
+
+    def test_max_categories_caps_output(self):
+        rows = m.collect_categories(fake_fetch, "https://x.example", "",
+                                    max_categories=1)
+        self.assertEqual(len(rows), 1)
+
+
 class WalkTests(unittest.TestCase):
     def test_hidden_container_still_lists_visible_children(self):
         tree = [{"name": "Root", "level": 1, "url_path": None, "children": [
