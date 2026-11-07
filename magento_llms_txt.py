@@ -21,8 +21,9 @@ import urllib.error
 import urllib.request
 from typing import Callable, Iterable, Optional
 
-DEFAULT_TIMEOUT = 20
+DEFAULT_TIMEOUT = 60
 MAX_DESCRIPTION_CHARS = 160
+DEFAULT_USER_AGENT = "magento-llms-txt/1.0"
 
 STORE_QUERY = """
 {
@@ -34,31 +35,23 @@ STORE_QUERY = """
 }
 """
 
-CATEGORY_QUERY = """
-{
-  categoryList {
-    name
-    url_path
-    include_in_menu
-    product_count
-    description
-    children {
-      name
-      url_path
-      include_in_menu
-      product_count
-      description
-      children {
-        name
-        url_path
-        include_in_menu
-        product_count
-        description
-      }
-    }
-  }
-}
-"""
+def category_query(with_counts: bool = False) -> str:
+    """Category tree query, two levels below the root.
+
+    product_count is opt-in. On a store with millions of products Magento
+    needs tens of seconds to compute it, and the request times out.
+    """
+    count = "product_count" if with_counts else ""
+    leaf = f"name url_path level include_in_menu description {count}"
+    return (
+        "{ categoryList { "
+        + leaf
+        + " children { " + leaf
+        + " children { " + leaf + " } } } }"
+    )
+
+
+CATEGORY_QUERY = category_query(False)
 
 CMS_QUERY = """
 query CmsPage($identifier: String!) {
@@ -78,17 +71,39 @@ class MagentoError(RuntimeError):
     """Raised when the store cannot be queried."""
 
 
+class GraphQLError(MagentoError):
+    """The store answered, but the query itself failed (for example, no such page)."""
+
+
+class _KeepPostRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow 301, 302, 303, 307 and 308 redirects and keep POST and its body.
+
+    urllib turns a redirected POST into a GET, which Magento answers with an
+    error. Stores that redirect http to https or www to non-www hit this.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if code not in (301, 302, 303, 307, 308):
+            return None
+        return urllib.request.Request(
+            newurl, data=req.data, headers=dict(req.header_items()),
+            method="POST",
+        )
+
+
 def make_fetcher(base_url: str, store_code: str | None = None,
-                 timeout: int = DEFAULT_TIMEOUT) -> Fetch:
+                 timeout: int = DEFAULT_TIMEOUT,
+                 user_agent: str = DEFAULT_USER_AGENT) -> Fetch:
     """Build a function that posts GraphQL queries to the store."""
     endpoint = base_url.rstrip("/") + "/graphql"
+    opener = urllib.request.build_opener(_KeepPostRedirects())
 
     def fetch(query: str, variables: dict | None = None) -> dict:
         body = json.dumps({"query": query, "variables": variables or {}})
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": "magento-llms-txt/1.0",
+            "User-Agent": user_agent,
         }
         if store_code:
             headers["Store"] = store_code
@@ -96,17 +111,22 @@ def make_fetcher(base_url: str, store_code: str | None = None,
             endpoint, data=body.encode("utf-8"), headers=headers, method="POST"
         )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with opener.open(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            raise MagentoError(f"{endpoint} returned HTTP {exc.code}") from exc
-        except (urllib.error.URLError, TimeoutError) as exc:
+            hint = (" (a firewall or bot filter may be blocking the script, "
+                    "try --user-agent)" if exc.code in (403, 429) else "")
+            raise MagentoError(
+                f"{endpoint} returned HTTP {exc.code}{hint}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise MagentoError(f"Could not reach {endpoint}: {exc}") from exc
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise MagentoError(f"{endpoint} did not return JSON") from exc
+        if not isinstance(payload, dict):
+            raise MagentoError(f"{endpoint} did not return a GraphQL response")
         if payload.get("errors") and not payload.get("data"):
             message = payload["errors"][0].get("message", "unknown error")
-            raise MagentoError(f"GraphQL error: {message}")
+            raise GraphQLError(f"GraphQL error: {message}")
         return payload.get("data") or {}
 
     return fetch
@@ -132,35 +152,40 @@ def join_url(base_url: str, path: str, suffix: str = "") -> str:
     return f"{base_url.rstrip('/')}/{path}{suffix}"
 
 
-def walk_categories(nodes: Iterable[dict], depth: int = 1, max_depth: int = 2):
-    """Yield (depth, category) for visible categories that have products.
+def walk_categories(nodes: Iterable[dict], depth: int = 1, max_depth: int = 2,
+                    include_hidden: bool = False, skip_empty: bool = False):
+    """Yield (depth, category) for the categories worth listing.
 
-    Magento's root category ("Default Category") has no url_path. It is not
-    listed itself, but its children are the store's real top-level categories,
-    so we descend into it without counting it as a level.
+    The store root ("Default Category", level 1) is never listed and does not
+    count as a level. Hidden categories are not listed either, but their
+    children are still checked on their own, because Magento shops often hide
+    a container like "Categories" and show what is inside it.
     """
     for node in nodes or []:
-        if not node.get("url_path"):
-            yield from walk_categories(node.get("children"), depth, max_depth)
-            continue
-        if node.get("include_in_menu") in (0, False):
-            continue
-        if (node.get("product_count") or 0) <= 0:
+        is_root = node.get("level") == 1 or not node.get("url_path")
+        hidden = (not include_hidden) and node.get("include_in_menu") in (0, False)
+        empty = skip_empty and (node.get("product_count") or 0) <= 0
+        if is_root or hidden or empty:
+            yield from walk_categories(node.get("children"), depth, max_depth,
+                                       include_hidden, skip_empty)
             continue
         yield depth, node
         if depth < max_depth:
-            yield from walk_categories(node.get("children"), depth + 1, max_depth)
+            yield from walk_categories(node.get("children"), depth + 1, max_depth,
+                                       include_hidden, skip_empty)
 
 
 def collect_categories(fetch: Fetch, base_url: str, suffix: str,
-                       max_depth: int = 2) -> list[tuple[int, str, str, str]]:
-    data = fetch(CATEGORY_QUERY, None)
+                       max_depth: int = 2, include_hidden: bool = False,
+                       skip_empty: bool = False) -> list[tuple[int, str, str, str]]:
+    data = fetch(category_query(skip_empty), None)
     roots = data.get("categoryList") or []
     rows = []
-    for depth, node in walk_categories(roots, 1, max_depth):
+    for depth, node in walk_categories(roots, 1, max_depth, include_hidden,
+                                       skip_empty):
         rows.append((
             depth,
-            node["name"].strip(),
+            (node.get("name") or node["url_path"]).strip(),
             join_url(base_url, node["url_path"], suffix),
             clean_text(node.get("description")),
         ))
@@ -171,14 +196,17 @@ def collect_cms_pages(fetch: Fetch, base_url: str,
                       identifiers: Iterable[str]) -> list[tuple[str, str, str]]:
     pages = []
     for identifier in identifiers:
-        data = fetch(CMS_QUERY, {"identifier": identifier})
+        try:
+            data = fetch(CMS_QUERY, {"identifier": identifier})
+        except GraphQLError:
+            data = {}
         page = data.get("cmsPage")
         if not page:
             print(f"warning: CMS page '{identifier}' not found, skipped",
                   file=sys.stderr)
             continue
         pages.append((
-            page["title"].strip(),
+            (page.get("title") or identifier).strip(),
             join_url(base_url, page.get("url_key") or identifier),
             clean_text(page.get("meta_description")),
         ))
@@ -197,6 +225,9 @@ def parse_extra_link(value: str) -> tuple[str, str, str]:
 
 
 def link_line(title: str, url: str, description: str = "") -> str:
+    title = html.unescape(title).replace("[", "(").replace("]", ")")
+    title = re.sub(r"\s+", " ", title).strip()
+    url = url.replace(" ", "%20").replace("(", "%28").replace(")", "%29")
     line = f"- [{title}]({url})"
     if description:
         line += f": {description}"
@@ -214,8 +245,14 @@ def build_llms_txt(name: str, summary: str,
     if notes:
         lines += [notes.strip(), ""]
 
-    top = [c for c in categories if c[0] == 1]
-    sub = [c for c in categories if c[0] > 1]
+    seen: set[str] = set()
+    unique = []
+    for row in categories:
+        if row[2] not in seen:
+            seen.add(row[2])
+            unique.append(row)
+    top = [c for c in unique if c[0] == 1]
+    sub = [c for c in unique if c[0] > 1]
 
     if top:
         lines += ["## Product categories", ""]
@@ -239,16 +276,18 @@ def build_llms_txt(name: str, summary: str,
 def generate(fetch: Fetch, base_url: str, summary: str = "",
              name: str | None = None, cms_pages: Iterable[str] = (),
              extra_links: Iterable[str] = (), notes: str = "",
-             max_depth: int = 2) -> str:
+             max_depth: int = 2, include_hidden: bool = False,
+             skip_empty: bool = False) -> str:
     store = (fetch(STORE_QUERY, None).get("storeConfig")) or {}
     suffix = store.get("category_url_suffix") or ""
     store_name = name or store.get("store_name") or base_url
-    categories = collect_categories(fetch, base_url, suffix, max_depth)
+    categories = collect_categories(fetch, base_url, suffix, max_depth,
+                                    include_hidden, skip_empty)
     pages = collect_cms_pages(fetch, base_url, cms_pages)
     extras = [parse_extra_link(v) for v in extra_links]
     if not categories and not pages and not extras:
         raise MagentoError(
-            "No categories with products were returned. Check the base URL, "
+            "No categories were returned. Check the base URL, "
             "the --store-code and that GraphQL is enabled."
         )
     return build_llms_txt(store_name, summary, categories, pages, extras, notes)
@@ -276,27 +315,47 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="Category levels to include (default 2)")
     parser.add_argument("--output", "-o", default="-",
                         help="File to write, or - for stdout (default)")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--include-hidden", action="store_true",
+                        help="Also list categories hidden from the menu")
+    parser.add_argument("--skip-empty", action="store_true",
+                        help="Skip categories with no products. Slow on very "
+                             "large catalogs, so it is off by default")
+    parser.add_argument("--user-agent", default=DEFAULT_USER_AGENT,
+                        help="User-Agent header. Change it if a firewall "
+                             "blocks the default")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                        help=f"Seconds per request (default {DEFAULT_TIMEOUT})")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None, fetch: Fetch | None = None) -> int:
     args = parse_args(argv)
-    fetch = fetch or make_fetcher(args.base_url, args.store_code, args.timeout)
+    fetch = fetch or make_fetcher(args.base_url, args.store_code, args.timeout,
+                                  args.user_agent)
+    if not args.name:
+        print("note: no --name given, so the store name from Magento is used. "
+              "That is often a store view name like 'English'.", file=sys.stderr)
     try:
         text = generate(
             fetch, args.base_url, summary=args.description, name=args.name,
             cms_pages=args.cms_page, extra_links=args.link, notes=args.notes,
-            max_depth=args.max_depth,
+            max_depth=args.max_depth, include_hidden=args.include_hidden,
+            skip_empty=args.skip_empty,
         )
     except (MagentoError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if args.output == "-":
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
         sys.stdout.write(text)
     else:
-        with open(args.output, "w", encoding="utf-8") as handle:
-            handle.write(text)
+        try:
+            with open(args.output, "w", encoding="utf-8") as handle:
+                handle.write(text)
+        except OSError as exc:
+            print(f"error: cannot write {args.output}: {exc}", file=sys.stderr)
+            return 1
         print(f"Wrote {args.output}", file=sys.stderr)
     return 0
 
