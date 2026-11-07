@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+llms.txt
+.venv/
