@@ -177,18 +177,29 @@ def walk_categories(nodes: Iterable[dict], depth: int = 1, max_depth: int = 2,
 
 def collect_categories(fetch: Fetch, base_url: str, suffix: str,
                        max_depth: int = 2, include_hidden: bool = False,
-                       skip_empty: bool = False) -> list[tuple[int, str, str, str]]:
+                       skip_empty: bool = False,
+                       exclude: Iterable[str] = (),
+                       max_categories: int = 0) -> list[tuple[int, str, str, str]]:
+    prefixes = [e.strip("/") for e in exclude if e.strip("/")]
     data = fetch(category_query(skip_empty), None)
     roots = data.get("categoryList") or []
     rows = []
     for depth, node in walk_categories(roots, 1, max_depth, include_hidden,
                                        skip_empty):
+        path = node["url_path"].strip("/")
+        if any(path == p or path.startswith(p + "/") for p in prefixes):
+            continue
         rows.append((
             depth,
             (node.get("name") or node["url_path"]).strip(),
             join_url(base_url, node["url_path"], suffix),
             clean_text(node.get("description")),
         ))
+    if max_categories and len(rows) > max_categories:
+        print(f"warning: {len(rows)} categories found, keeping the first "
+              f"{max_categories}. Use --exclude or --max-categories to adjust.",
+              file=sys.stderr)
+        rows = rows[:max_categories]
     return rows
 
 
@@ -277,12 +288,14 @@ def generate(fetch: Fetch, base_url: str, summary: str = "",
              name: str | None = None, cms_pages: Iterable[str] = (),
              extra_links: Iterable[str] = (), notes: str = "",
              max_depth: int = 2, include_hidden: bool = False,
-             skip_empty: bool = False) -> str:
+             skip_empty: bool = False, exclude: Iterable[str] = (),
+             max_categories: int = 200) -> str:
     store = (fetch(STORE_QUERY, None).get("storeConfig")) or {}
     suffix = store.get("category_url_suffix") or ""
     store_name = name or store.get("store_name") or base_url
     categories = collect_categories(fetch, base_url, suffix, max_depth,
-                                    include_hidden, skip_empty)
+                                    include_hidden, skip_empty, exclude,
+                                    max_categories)
     pages = collect_cms_pages(fetch, base_url, cms_pages)
     extras = [parse_extra_link(v) for v in extra_links]
     if not categories and not pages and not extras:
@@ -317,6 +330,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="File to write, or - for stdout (default)")
     parser.add_argument("--include-hidden", action="store_true",
                         help="Also list categories hidden from the menu")
+    parser.add_argument("--exclude", action="append", default=[],
+                        metavar="URL_PATH",
+                        help="Skip this category and everything under it, e.g. "
+                             "brands. Repeat for more")
+    parser.add_argument("--max-categories", type=int, default=200,
+                        help="Keep at most this many category links "
+                             "(default 200, 0 for no limit)")
     parser.add_argument("--skip-empty", action="store_true",
                         help="Skip categories with no products. Slow on very "
                              "large catalogs, so it is off by default")
@@ -340,7 +360,8 @@ def main(argv: list[str] | None = None, fetch: Fetch | None = None) -> int:
             fetch, args.base_url, summary=args.description, name=args.name,
             cms_pages=args.cms_page, extra_links=args.link, notes=args.notes,
             max_depth=args.max_depth, include_hidden=args.include_hidden,
-            skip_empty=args.skip_empty,
+            skip_empty=args.skip_empty, exclude=args.exclude,
+            max_categories=args.max_categories,
         )
     except (MagentoError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)

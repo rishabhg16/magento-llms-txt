@@ -1,10 +1,19 @@
 # magento-llms-txt
 
-Generate an `llms.txt` file for a Magento 2 store, straight from its GraphQL API.
+[![Tests](https://github.com/rishabhg16/magento-llms-txt/actions/workflows/tests.yml/badge.svg)](https://github.com/rishabhg16/magento-llms-txt/actions/workflows/tests.yml)
+![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue)
+![License MIT](https://img.shields.io/badge/license-MIT-green)
+![Dependencies none](https://img.shields.io/badge/dependencies-none-brightgreen)
 
-`llms.txt` is a plain markdown file at the root of your site. It gives AI assistants and search agents a short, clean map of what your store sells and where to find it. See https://llmstxt.org for the format.
+An llms.txt generator for Magento 2 stores. It reads your categories and CMS pages from the GraphQL API and writes a clean `llms.txt` file, so ChatGPT, Claude, Perplexity and other AI assistants can find what your store sells.
 
-This tool reads your visible categories and a few CMS pages, then writes the file. It has no dependencies. It only needs Python 3.9 or newer.
+`llms.txt` is a plain markdown file at the root of your site. It gives AI assistants and search agents a short map of your store. See https://llmstxt.org for the format.
+
+- One Python file, standard library only. Nothing to install.
+- Built for Magento 2.4 and newer with GraphQL on. Multi-store setups work through `--store-code`.
+- Safe on large catalogs. It skips the slow product counts by default, so it finishes on stores with millions of products.
+- Read only. It sends public storefront queries and needs no login or API key.
+- Tested on Python 3.9, 3.11 and 3.13 in CI.
 
 ## Quick start
 
@@ -30,6 +39,8 @@ Then upload `llms.txt` to the web root of your store, so it opens at `https://sh
 | `--cms-page` | CMS page identifier to list. Repeat for more pages. |
 | `--link` | Extra link as `Title\|URL\|description`. Repeat for more. |
 | `--max-depth` | `1` for top categories only, `2` to include subcategories (default). |
+| `--exclude` | Skip a category and everything under it, by URL path (for example `brands`). Repeat for more. |
+| `--max-categories` | Keep at most this many category links. Default 200, `0` for no limit. Big stores can have thousands of brand pages, and llms.txt should stay short. |
 | `--include-hidden` | Also list categories hidden from the menu. |
 | `--skip-empty` | Skip categories with no products. Slow on very large catalogs, so it is off by default. |
 | `--user-agent` | Change the User-Agent header if a firewall blocks the default. |
