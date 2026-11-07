@@ -14,21 +14,21 @@ STORE = {"storeConfig": {"store_name": "Acme Parts", "base_url": "x",
                          "category_url_suffix": ".html"}}
 
 CATEGORIES = {"categoryList": [{
-    "name": "Root", "url_path": None, "include_in_menu": 1, "product_count": 9,
+    "name": "Root", "url_path": None, "level": 1, "include_in_menu": 1, "product_count": 9,
     "description": None,
     "children": [
-        {"name": "Filters", "url_path": "filters", "include_in_menu": 1,
+        {"name": "Filters", "level": 2, "url_path": "filters", "include_in_menu": 1,
          "product_count": 120,
          "description": "<p>Oil, air &amp; fuel filters for <b>tractors</b>.</p>",
          "children": [
-             {"name": "Oil filters", "url_path": "filters/oil", "include_in_menu": 1,
+             {"name": "Oil filters", "level": 3, "url_path": "filters/oil", "include_in_menu": 1,
               "product_count": 40, "description": ""},
-             {"name": "Hidden", "url_path": "filters/hidden", "include_in_menu": 0,
+             {"name": "Hidden", "level": 3, "url_path": "filters/hidden", "include_in_menu": 0,
               "product_count": 5, "description": ""},
-             {"name": "Empty", "url_path": "filters/empty", "include_in_menu": 1,
+             {"name": "Empty", "level": 3, "url_path": "filters/empty", "include_in_menu": 1,
               "product_count": 0, "description": ""},
          ]},
-        {"name": "Brakes", "url_path": "brakes", "include_in_menu": 1,
+        {"name": "Brakes", "level": 2, "url_path": "brakes", "include_in_menu": 1,
          "product_count": 30, "description": None, "children": []},
     ],
 }]}
@@ -79,9 +79,26 @@ class GenerateTests(unittest.TestCase):
             "- [Filters](https://shop.example.com/filters.html): "
             "Oil, air & fuel filters for tractors.", self.text)
 
-    def test_hidden_and_empty_categories_skipped(self):
+    def test_hidden_categories_skipped_by_default(self):
         self.assertNotIn("Hidden", self.text)
-        self.assertNotIn("Empty", self.text)
+
+    def test_empty_categories_kept_by_default(self):
+        self.assertIn("[Empty]", self.text)
+
+    def test_skip_empty_option(self):
+        text = m.generate(fake_fetch, "https://shop.example.com",
+                          skip_empty=True)
+        self.assertNotIn("[Empty]", text)
+        self.assertIn("[Oil filters]", text)
+
+    def test_include_hidden_option(self):
+        text = m.generate(fake_fetch, "https://shop.example.com",
+                          include_hidden=True)
+        self.assertIn("[Hidden]", text)
+
+    def test_product_count_not_requested_by_default(self):
+        self.assertNotIn("product_count", m.category_query(False))
+        self.assertIn("product_count", m.category_query(True))
 
     def test_subcategories_go_under_optional(self):
         optional = self.text.split("## Optional")[1]
@@ -119,6 +136,33 @@ class GenerateTests(unittest.TestCase):
             m.generate(empty, "https://shop.example.com")
 
 
+class WalkTests(unittest.TestCase):
+    def test_hidden_container_still_lists_visible_children(self):
+        tree = [{"name": "Root", "level": 1, "url_path": None, "children": [
+            {"name": "Categories", "level": 2, "url_path": "categories",
+             "include_in_menu": 0, "children": [
+                 {"name": "Tyres", "level": 3, "url_path": "categories/tyres",
+                  "include_in_menu": 1}]}]}]
+        rows = list(m.walk_categories(tree))
+        self.assertEqual([(d, n["name"]) for d, n in rows], [(1, "Tyres")])
+
+    def test_cms_graphql_error_is_skipped_not_fatal(self):
+        def fetch(query, variables=None):
+            raise m.GraphQLError("The CMS page doesn't exist")
+        self.assertEqual(m.collect_cms_pages(fetch, "https://x.example", ["a"]), [])
+
+
+class LinkLineTests(unittest.TestCase):
+    def test_brackets_and_entities_in_title(self):
+        line = m.link_line("Hose [8mm] &amp; clamp", "https://x.example/a b")
+        self.assertEqual(line, "- [Hose (8mm) & clamp](https://x.example/a%20b)")
+
+    def test_duplicate_urls_listed_once(self):
+        rows = [(1, "A", "https://x.example/a", ""), (1, "A2", "https://x.example/a", "")]
+        text = m.build_llms_txt("S", "", rows, [], [])
+        self.assertEqual(text.count("https://x.example/a"), 1)
+
+
 class LinkParsingTests(unittest.TestCase):
     def test_bad_link_rejected(self):
         with self.assertRaises(ValueError):
@@ -136,6 +180,10 @@ class CliTests(unittest.TestCase):
             self.assertEqual(code, 0)
             with open(out, encoding="utf-8") as handle:
                 self.assertTrue(handle.read().startswith("# Acme Parts"))
+
+    def test_unwritable_output_returns_nonzero(self):
+        self.assertEqual(m.main(["--base-url", "https://x.example", "--output",
+                                 "/nonexistent-dir/llms.txt"], fetch=fake_fetch), 1)
 
     def test_error_returns_nonzero(self):
         def boom(query, variables=None):
@@ -165,6 +213,34 @@ class FakeMagento(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+
+class RedirectingMagento(BaseHTTPRequestHandler):
+    """Redirects /old/graphql to /graphql, as an http to https redirect would."""
+
+    def do_POST(self):
+        if self.path == "/old/graphql":
+            self.send_response(301)
+            self.send_header("Location", "/graphql")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        FakeMagento.do_POST(self)
+
+    log_message = FakeMagento.log_message
+
+
+class RedirectTests(unittest.TestCase):
+    def test_post_survives_redirect(self):
+        server = HTTPServer(("127.0.0.1", 0), RedirectingMagento)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            base = f"http://127.0.0.1:{server.server_address[1]}/old"
+            data = m.make_fetcher(base)(m.STORE_QUERY, None)
+            self.assertEqual(data["storeConfig"]["store_name"], "Acme Parts")
+        finally:
+            server.shutdown()
+            server.server_close()
 
 
 class HttpTests(unittest.TestCase):
